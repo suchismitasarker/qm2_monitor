@@ -2,7 +2,8 @@
 name: Containers (Apptainer build, test, push)
 
 # Builds qm2monitor.sif from qm2monitor.def, runs the image's own tests and
-# a smoke test (page serves; the CHESS archive is not needed), keeps the
+# a smoke test (page serves; the CHESS archive is not needed), a Trivy
+# vulnerability scan (report only; also every Monday), keeps the
 # .sif as an artifact and, outside pull requests, pushes it to GHCR:
 #   oras://ghcr.io/<owner>/qm2monitor:<branch|tag>  (+ :latest on main)
 on:
@@ -11,6 +12,8 @@ on:
     tags: ["v*.*.*"]
   pull_request:
     branches: ["main"]
+  schedule:
+    - cron: "0 6 * * 1"       # every Monday 06:00 UTC: rebuild + Trivy scan
   workflow_dispatch: {}
 
 permissions:
@@ -61,6 +64,37 @@ jobs:
           curl -sf localhost:8051/ | grep -q "QM2 (CHESS ID4B) beamline status"
           curl -sf localhost:8051/api/status
           kill %1
+
+      - name: Trivy vulnerability scan (report only, never fails the build)
+        run: |
+          apptainer build --sandbox qm2monitor_sandbox qm2monitor.sif
+          mkdir -p trivy_cache
+          apptainer run docker://aquasec/trivy:0.58.1 rootfs --scanners vuln \
+            --cache-dir "$PWD/trivy_cache" --exit-code 0 \
+            --format table -o trivy_report.txt qm2monitor_sandbox
+          apptainer run docker://aquasec/trivy:0.58.1 rootfs --scanners vuln \
+            --cache-dir "$PWD/trivy_cache" --exit-code 0 \
+            --severity HIGH,CRITICAL --format table -o trivy_high.txt qm2monitor_sandbox
+          {
+            echo "## Trivy scan of qm2monitor.sif"
+            echo '```'
+            grep -E "^Total" trivy_report.txt || echo "no findings"
+            echo '```'
+            echo "### HIGH and CRITICAL"
+            echo '```'
+            head -150 trivy_high.txt
+            echo '```'
+            echo "Full report: artifact trivy-report"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: |
+            trivy_report.txt
+            trivy_high.txt
+          retention-days: 30
 
       - name: Upload image
         uses: actions/upload-artifact@v4

@@ -47,6 +47,8 @@ then `bash run.sh stop && bash build.sh && bash run.sh start`.
                     smoke test (page serves), artifact 14 days; push to
                     oras://ghcr.io/<owner>/qm2monitor:<branch|tag> (+ :latest on main)
     release.yml     tag v1.0.0 ...: GitHub Release with the .sif + source tarball
+    (containers.yml also runs a Trivy scan of the image: job summary +
+     artifact trivy-report, never fails the build; and every Monday 06:00 UTC)
 
 First time (no repository yet):
 1. github.com -> New repository -> name `qm2_monitor`, Private, no README.
