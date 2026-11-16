@@ -25,6 +25,10 @@ From: python:3.11-slim-bookworm
     pip install --no-cache-dir --upgrade pip setuptools wheel
     pip install --no-cache-dir -r /opt/qm2monitor/requirements.lock
     python -m compileall -q /opt/qm2monitor/ml
+    # packaging tools are only needed during the build: remove them so the
+    # image carries no pip / setuptools / wheel (pip's vendored setuptools
+    # 70.3.0 was still reported by Trivy). The monitor does not need them.
+    python -m pip uninstall -y pip setuptools wheel
 
 %environment
     export TZ=America/New_York
