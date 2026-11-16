@@ -1,0 +1,79 @@
+---
+name: Containers (Apptainer build, test, push)
+
+# Builds qm2monitor.sif from qm2monitor.def, runs the image's own tests and
+# a smoke test (page serves; the CHESS archive is not needed), keeps the
+# .sif as an artifact and, outside pull requests, pushes it to GHCR:
+#   oras://ghcr.io/<owner>/qm2monitor:<branch|tag>  (+ :latest on main)
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: qm2monitor
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: "pip"}
+      - run: pip install -r requirements.lock
+      - run: python -m unittest -v tests/test_monitor_offline.py
+
+  apptainer:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Apptainer
+        run: |
+          sudo add-apt-repository -y ppa:apptainer/ppa
+          sudo apt-get update
+          sudo apt-get install -y apptainer
+
+      - name: Build image (runs apptainer test)
+        run: |
+          sudo -E bash build.sh
+          sudo chown "$(id -u):$(id -g)" qm2monitor.sif
+
+      - name: Smoke test
+        run: |
+          export QM2_OUT="$RUNNER_TEMP/out" QM2_PORT=8051 QM2_NO_FLUX=1
+          apptainer run qm2monitor.sif &
+          for i in $(seq 1 30); do
+            curl -sf localhost:8051/ | grep -q "QM2 (CHESS ID4B) beamline status" && break
+            sleep 2
+          done
+          curl -sf localhost:8051/ | grep -q "QM2 (CHESS ID4B) beamline status"
+          curl -sf localhost:8051/api/status
+          kill %1
+
+      - name: Upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: qm2monitor-sif
+          path: qm2monitor.sif
+          retention-days: 14
+
+      - name: Push to GHCR (ORAS)
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | apptainer registry login \
+            -u "${{ github.actor }}" --password-stdin oras://ghcr.io
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          TAG=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')
+          apptainer push qm2monitor.sif "oras://ghcr.io/$OWNER/$IMAGE_NAME:$TAG"
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            apptainer push qm2monitor.sif "oras://ghcr.io/$OWNER/$IMAGE_NAME:latest"
+          fi

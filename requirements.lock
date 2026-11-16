@@ -1,0 +1,6 @@
+# Exact versions tested with the monitor (Python 3.11, 2026-11-15)
+numpy==2.4.6
+pandas==3.1.1
+matplotlib==3.11.2
+fastapi==0.163.1
+uvicorn==0.54.0

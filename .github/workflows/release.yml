@@ -1,0 +1,76 @@
+---
+name: Release
+
+# On a version tag (v1.0.0, ...): test, build the .sif, make a source
+# tarball and create a GitHub Release with both attached. The GHCR image
+# for the tag is pushed by containers.yml in parallel.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: qm2monitor
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: "pip"}
+      - run: pip install -r requirements.lock
+      - run: python -m unittest -v tests/test_monitor_offline.py
+
+  apptainer:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Apptainer
+        run: |
+          sudo add-apt-repository -y ppa:apptainer/ppa
+          sudo apt-get update
+          sudo apt-get install -y apptainer
+      - name: Build image
+        run: |
+          sudo -E bash build.sh
+          sudo chown "$(id -u):$(id -g)" qm2monitor.sif
+          mv qm2monitor.sif "qm2monitor-${GITHUB_REF_NAME}.sif"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sif
+          path: qm2monitor-*.sif
+
+  source-tarball:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git archive --format=tar.gz --prefix="qm2_monitor-${GITHUB_REF_NAME}/" -o "qm2_monitor-${GITHUB_REF_NAME}.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: qm2_monitor-*.tar.gz
+
+  release:
+    needs: [apptainer, source-tarball]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {path: dist, merge-multiple: true}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            QM2 beamline monitor ${{ github.ref_name }}.
+            On lnx201: download the .sif (or
+            `apptainer pull qm2monitor.sif oras://ghcr.io/${{ github.repository_owner }}/qm2monitor:${{ github.ref_name }}`),
+            then `bash run.sh start` (see README).

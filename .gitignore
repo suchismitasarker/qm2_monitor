@@ -1,0 +1,8 @@
+*.sif
+__pycache__/
+*.pyc
+.DS_Store
+results/
+qm2monitor_sandbox/
+trivy_*.txt
+trivy_cache/

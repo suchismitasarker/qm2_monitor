@@ -1,0 +1,52 @@
+# Apptainer image for the QM2 (CHESS ID4B) beamline monitor (read only).
+# Build inside this folder (paths in %files are relative to it). The whole
+# ml/ folder is copied: ml/flux_table.json is optional (no table = no flux).
+#   bash build.sh
+Bootstrap: docker
+From: python:3.11-slim-bookworm
+
+%labels
+    Name qm2monitor
+    Description QM2 beamline status page from the CHESS Signals archive
+    Version 1.1 (light flux check: lookup table)
+
+%files
+    requirements.lock /opt/qm2monitor/requirements.lock
+    ml /opt/qm2monitor/
+    launch.sh /opt/qm2monitor/launch.sh
+    tests/test_monitor_offline.py /opt/qm2monitor/tests/test_monitor_offline.py
+
+%post
+    # tzdata: the monitor works in CHESS local time (America/New_York)
+    apt-get update && apt-get install -y --no-install-recommends tzdata curl
+    rm -rf /var/lib/apt/lists/*
+    pip install --no-cache-dir -r /opt/qm2monitor/requirements.lock
+    python -m compileall -q /opt/qm2monitor/ml
+
+%environment
+    export TZ=America/New_York
+    export MPLCONFIGDIR=/tmp/qm2monitor-mpl
+    export MPLBACKEND=Agg
+    export PYTHONDONTWRITEBYTECODE=1
+
+%runscript
+    # apptainer run qm2monitor.sif [extra monitor_api.py options]
+    # settings: see /opt/qm2monitor/launch.sh (QM2_PORT, QM2_ENERGY, ...)
+    exec bash /opt/qm2monitor/launch.sh "$@"
+
+%startscript
+    # apptainer instance start qm2monitor.sif qm2mon   (background service)
+    exec bash /opt/qm2monitor/launch.sh
+
+%test
+    cd /opt/qm2monitor
+    python -m unittest -v tests/test_monitor_offline.py
+
+%help
+    QM2 beamline monitor (read only, CHESS Signals archive).
+      apptainer run qm2monitor.sif                  # foreground, port 8051
+      apptainer instance start qm2monitor.sif qm2mon  # background
+      apptainer instance stop qm2mon
+    Environment: QM2_PORT (8051), QM2_HOST (127.0.0.1), QM2_OUT
+    (~/qm2monitor_results); flux check: QM2_ENERGY + QM2_GAIN, or
+    QM2_SPEC_DIR, or QM2_NO_FLUX=1. Open: ssh -N -L 8051:localhost:8051 <host>
