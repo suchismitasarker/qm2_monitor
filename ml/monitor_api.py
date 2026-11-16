@@ -35,7 +35,7 @@ import beamline_monitor as bm  # noqa: E402
 from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.responses import FileResponse, HTMLResponse  # noqa: E402
 
-CFG = dict(hours=24.0, refresh=10.0, energy=None, gain=None,
+CFG = dict(hours=24.0, refresh=10.0, fast=1.0, energy=None, gain=None,
            spec_dir=bm.SPEC_DIR, no_flux=False,
            out=HERE / "results" / "monitor")
 STATE = {"checks": [], "overall": "starting", "window": None,
@@ -57,6 +57,8 @@ def run_checks(hours, end=None, energy=None, gain=None, write=True):
     e, g, src = bm.resolve_energy_gain(energy, gain, CFG["spec_dir"],
                                        CFG["no_flux"])
     out, series = bm.analyse(df, e, g, t1, src)
+    if not end:                         # live: beam rows at full resolution
+        bm.use_beam_rows(out, t1)
     bm.add_cryo(out, series, t0, t1)
     if write:
         worst, _ = bm.report(out, series, t0, t1, CFG["out"])
@@ -74,8 +76,8 @@ def refresh_once():
     try:
         res = run_checks(CFG["hours"], None, CFG["energy"], CFG["gain"])
         with LOCK:
-            STATE.update(res, updated=dt.datetime.now().isoformat(
-                timespec="seconds"), error=None)
+            now = dt.datetime.now().isoformat(timespec="seconds")
+            STATE.update(res, updated=now, beam_updated=now, error=None)
     except Exception as e:                          # keep serving
         with LOCK:
             STATE.update(error=f"{type(e).__name__}: {e}",
@@ -83,10 +85,40 @@ def refresh_once():
                              timespec="seconds"))
 
 
+def _worst(checks):
+    ranks = [c["status"] for c in checks]
+    return ("ALERT" if "ALERT" in ranks else "WARN" if "WARN" in ranks
+            else "OK")
+
+
+def refresh_beam():
+    """Light update every CFG['fast'] minutes: beam status and counters
+    (last bm.STATUS_MIN min, full archive resolution); the other checks
+    keep their last full read."""
+    try:
+        fresh = {c: (v, s) for _, c, v, s in bm.beam_rows(dt.datetime.now())}
+    except Exception:                               # keep the last values
+        return
+    with LOCK:
+        if not STATE["checks"]:
+            return
+        for c in STATE["checks"]:
+            if c["check"] in fresh:
+                c["value"], c["status"] = fresh[c["check"]]
+        STATE["overall"] = _worst(STATE["checks"])
+        STATE["beam_updated"] = dt.datetime.now().isoformat(
+            timespec="seconds")
+
+
 def loop():
+    next_full = 0.0
     while True:
-        refresh_once()
-        time.sleep(CFG["refresh"] * 60)
+        if time.time() >= next_full:
+            refresh_once()
+            next_full = time.time() + CFG["refresh"] * 60
+        else:
+            refresh_beam()
+        time.sleep(min(CFG["fast"], CFG["refresh"]) * 60)
 
 
 @app.get("/api/status")
@@ -130,12 +162,14 @@ def history(last: int = 200):
 HELP = {
     "counters now": ("ic1, ic2 and the beam-stop diode as SPEC shows them "
                      "(counts per 0.1 s count time), median of the last "
-                     "15 min, and the ring current.", ""),
+                     "1 min (updated every minute), and the ring current.",
+                     ""),
     "experiment status": ("Hutch Closed - Experiment Running when ic2 and "
                           "the beam-stop "
                           "diode both show signal (ic2 > 0.1 V = 1,000 "
                           "counts, diode > 0.05 V = 500 counts per 0.1 s, "
-                          "over the last 15 min). Hutch Closed - Beam in "
+                          "median of the last 1 min, updated every minute). "
+                          "Hutch Closed - Beam in "
                           "Hutch, Experiment NOT Running: beam on ic1 "
                           "(> 2,000 counts), none on ic2 and the diode. "
                           "Hutch Open - No Beam: ic1 about 0 (e.g. 60 "
@@ -253,7 +287,7 @@ def page():
                 f"<li><span>{html.escape(x.split(' ', 1)[0])}</span><span "
                 f"class='v'>{html.escape(x.split(' ', 1)[1])}</span></li>"
                 for x in parts.split(" · ")) + \
-                "<li><span class='muted'>counts per 0.1 s, last 15 min" \
+                "<li><span class='muted'>counts per 0.1 s, last 1 min" \
                 "</span><span></span></li>"
         else:
             lines = "".join(
@@ -306,7 +340,7 @@ def page():
                 f"</span><span class='dot'></span><b>{html.escape(exp_state)}"
                 f"</b><span class='counts'>{html.escape(cnt)}</span></div>"
                 if exp else "")
-    reload_s = 10 if starting else 300
+    reload_s = 10 if starting else 60
     plot = ("" if starting else
             f"<h2>Last {CFG['hours']:g} h</h2><figure><img src='/plot.png?t="
             f"{time.time():.0f}' alt='Vacuum, roughing line, ic1, ic2/ic1, "
@@ -405,8 +439,9 @@ th:nth-child(1),td:nth-child(1){{width:70px}}}}
 {exp_html}
 <div class="banner b-{overall}"><span class="lbl">BEAMLINE HEALTH</span><span class="big">{html.escape(overall.upper())}
 </span><span>{SENTENCE.get(overall, '')}</span></div>
-<div class="meta">Updated {_ago(st.get('updated'))} · window {win} · re-read
-every {CFG['refresh']:g} min · page refreshes by itself</div>
+<div class="meta">Beam status updated {_ago(st.get('beam_updated') or st.get('updated'))}
+(every {CFG['fast']:g} min) · other checks updated {_ago(st.get('updated'))}
+(every {CFG['refresh']:g} min) · window {win} · page refreshes every minute</div>
 {err}
 <h2>Overview</h2><div class="grid">{''.join(cards)}</div>
 <h2>Details</h2>{table}
@@ -430,7 +465,9 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--refresh", type=float, default=10.0,
-                    help="minutes between archive reads")
+                    help="minutes between full archive reads")
+    ap.add_argument("--fast", type=float, default=1.0,
+                    help="minutes between beam-status/counter updates")
     ap.add_argument("--energy", type=float, default=None)
     ap.add_argument("--gain", type=float, default=None)
     ap.add_argument("--spec-dir", type=Path, default=bm.SPEC_DIR)
@@ -444,7 +481,8 @@ def main() -> None:
     a = ap.parse_args()
     if a.flux_table:
         bm.FLUX_TABLE = a.flux_table
-    CFG.update(hours=a.hours, refresh=a.refresh, energy=a.energy,
+    CFG.update(hours=a.hours, refresh=a.refresh, fast=a.fast,
+               energy=a.energy,
                gain=a.gain, spec_dir=a.spec_dir, no_flux=a.no_flux,
                out=a.out)
     threading.Thread(target=loop, daemon=True).start()

@@ -18,7 +18,8 @@ Checks (limits from the normal 2026-3 behaviour; see LIMITS):
               parked at 4.52 V = feedback off
   stale       a gauge with no data for > 2 h is reported
   experiment  "Experiment running" when ic2 > 0.1 V and diode > 0.05 V over
-              the last 15 min (INFO): "Hutch Closed - Experiment Running";
+              the last 1 min (INFO; full-resolution read, updated every
+              minute by monitor_api): "Hutch Closed - Experiment Running";
               ic1 > 0.2 V only: "Hutch Closed - Beam in Hutch, Experiment
               NOT Running"; ring on, no ic1: "Hutch Open - No Beam"; ring
               off: "No Beam in CESR"; ic1 switching between beam
@@ -84,16 +85,22 @@ MOSTAB_PARK = 4.52
 # medians): ic2 0.009 V (max 0.06), diode (CNT03) 0.0025 V (95 % 0.014);
 # with an experiment the diode is ~0.35 V, up to 0.78 V (3,500-7,800
 # counts per 0.1 s).
-EXP_IC2_V, EXP_DIODE_V, EXP_MIN = 0.10, 0.05, 15
+EXP_IC2_V, EXP_DIODE_V = 0.10, 0.05
+# beam status + counters: median of the last STATUS_MIN minutes (user, 16
+# Nov 2026: 1 min; was 15). The archive logs the counters every ~1 s, ic2
+# and the diode on change only, so the last value before the window is
+# included. Beam-motion switches still need a longer view (MOTION_MIN).
+STATUS_MIN, MOTION_MIN = 1, 15
+EXP_MIN = STATUS_MIN
 # beam motion (user, 15 Nov 2026): ic1 jumping between ~60 and ~19,000
 # counts and back within minutes. Count switches between "beam" (ic1 >
 # 0.2 V = 2,000 counts) and "no beam" (ic1 < 0.02 V = 200 counts) in the
-# last EXP_MIN minutes; >= MOTION_SWITCHES (2 full up-down cycles) with
+# last MOTION_MIN minutes; >= MOTION_SWITCHES (2 full up-down cycles) with
 # the ring on = "Check Beam Motion".
 IC1_HI_V, IC1_LO_V, MOTION_SWITCHES = 0.2, 0.02, 4
 
 
-def ic1_switches(ic1, t_end, minutes=EXP_MIN):
+def ic1_switches(ic1, t_end, minutes=MOTION_MIN):
     """Number of beam <-> no-beam switches of ic1 in the last minutes."""
     w = ic1[ic1.index >= t_end - dt.timedelta(minutes=minutes)]
     lvl = [1 if v > IC1_HI_V else 0 for v in w.values
@@ -104,12 +111,24 @@ COUNT_TIME = 0.1
 V2F = 1.0e5
 
 
+def _recent(x, t_end, minutes=STATUS_MIN):
+    """Median of the last minutes up to t_end, including the last value
+    before the window (on-change logging); nan if nothing in the last
+    minutes + 10 min."""
+    x = x[x.index <= t_end]
+    t0 = t_end - dt.timedelta(minutes=minutes)
+    w = x[x.index >= t0]
+    before = x[(x.index < t0) & (x.index >= t0 - dt.timedelta(minutes=10))]
+    if len(before):
+        w = pd.concat([before.iloc[-1:], w])
+    return float(w.median()) if len(w) else float("nan")
+
+
 def counters_now(ic1, ic2, diode, ring, t_end):
-    """Counter values of the last EXP_MIN minutes as SPEC shows them
+    """Counter values of the last STATUS_MIN minutes as SPEC shows them
     (counts per 0.1 s count time), and the ring current."""
     def recent(x):
-        w = x[x.index >= t_end - dt.timedelta(minutes=EXP_MIN)]
-        return float(w.median()) if len(w) else float("nan")
+        return _recent(x, t_end)
     parts = []
     for name, x in (("ic1", ic1), ("ic2", ic2), ("diode", diode)):
         v = recent(x)
@@ -125,8 +144,7 @@ def counters_now(ic1, ic2, diode, ring, t_end):
 def experiment_state(ic1, ic2, diode, ring, t_end):
     """(state, text, share of the window with the experiment running)."""
     def recent(x):
-        w = x[x.index >= t_end - dt.timedelta(minutes=EXP_MIN)]
-        return float(w.median()) if len(w) else float("nan")
+        return _recent(x, t_end)
     i1, i2, d, r = recent(ic1), recent(ic2), recent(diode), recent(ring)
     grid = pd.concat([x.resample("5min").median().rename(k) for k, x in
                       (("ic2", ic2), ("diode", diode))], axis=1).dropna()
@@ -151,7 +169,7 @@ def experiment_state(ic1, ic2, diode, ring, t_end):
         state = "No Beam in CESR"
     else:
         state = "Unknown (no recent data)"
-    txt = f"{state} ({vals}; last {EXP_MIN} min)"
+    txt = f"{state} ({vals}; last {STATUS_MIN:g} min)"
     if np.isfinite(share):
         txt += f"; running {100 * share:.0f} % of the window"
     return state, txt, share
@@ -538,6 +556,51 @@ def add_cryo(out, series, t0, t1):
         series["cryo"] = ser
 
 
+def fetch_beam(t_end: dt.datetime, minutes: float = MOTION_MIN + 2):
+    """ic1, ic2, diode and ring current of the last minutes at full archive
+    resolution (~1 s; one small request, ~0.3 s)."""
+    keys = ("ic1", "ic2", "diode", "ring")
+    pvs = [PV[k] for k in keys]
+    url = URL.format(pvs=";".join(pvs), n=";".join(["3000"] * len(pvs)),
+                     t0=int((t_end - dt.timedelta(minutes=minutes))
+                            .timestamp() * 1000),
+                     t1=int(t_end.timestamp() * 1000))
+    with urllib.request.urlopen(url, timeout=60) as r:
+        data = json.load(r)
+    out = {k: pd.Series(dtype=float) for k in keys}
+    name = {PV[k]: k for k in keys}
+    for pv in data:
+        xy = [(x, y) for x, y in zip(pv["x"], pv["y"]) if y is not None]
+        if xy:
+            t = (pd.to_datetime([a for a, _ in xy], unit="s", utc=True)
+                 .tz_convert("America/New_York").tz_localize(None))
+            out[name[pv["name"]]] = pd.Series([b for _, b in xy], index=t)
+    return out
+
+
+def beam_rows(t_end: dt.datetime):
+    """The two beam rows (experiment status, counters now) from fresh
+    full-resolution data."""
+    b = fetch_beam(t_end)
+    state, txt, _ = experiment_state(b["ic1"], b["ic2"], b["diode"],
+                                     b["ring"], t_end)
+    return [("experiment", "experiment status", txt,
+             "WARN" if state == "Check Beam Motion" else "INFO"),
+            ("experiment", "counters now", counters_now(
+                b["ic1"], b["ic2"], b["diode"], b["ring"], t_end), "INFO")]
+
+
+def use_beam_rows(out, t_end):
+    """Replace the beam rows in out (computed from the coarse 24 h read)
+    by full-resolution ones; keep the coarse rows if the read fails."""
+    try:
+        fresh = {r[1]: r for r in beam_rows(t_end)}
+    except Exception:                       # archive hiccup: keep coarse
+        return out
+    out[:] = [fresh.get(r[1], r) for r in out]
+    return out
+
+
 def run_once(a):
     t1 = dt.datetime.fromisoformat(a.end) if a.end else dt.datetime.now()
     t0 = t1 - dt.timedelta(hours=a.hours)
@@ -545,6 +608,7 @@ def run_once(a):
     energy, gain, source = resolve_energy_gain(a.energy, a.gain,
                                                a.spec_dir, a.no_flux)
     out, series = analyse(df, energy, gain, t1, source)
+    use_beam_rows(out, t1)
     add_cryo(out, series, t0, t1)
     worst, lines = report(out, series, t0, t1, a.out)
     print("\n".join(lines))
